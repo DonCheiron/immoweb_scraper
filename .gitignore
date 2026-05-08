@@ -1,0 +1,5 @@
+seen_listings.json
+scraper.log
+__pycache__/
+*.pyc
+.env
