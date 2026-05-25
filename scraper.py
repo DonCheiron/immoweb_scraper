@@ -1,5 +1,6 @@
 """
 Immoweb Scraper — CSV export for local on-demand analysis.
+Generates two CSVs: one for sales, one for rentals.
 """
 
 import csv
@@ -14,10 +15,30 @@ import requests
 from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────
-#  CONFIG — edit these before running
+#  SEARCH FILTERS — edit these before running
+#  Set a value to None to exclude that filter.
 # ─────────────────────────────────────────────
-CSV_OUTPUT_FILE = Path("immoweb_listings.csv")
-CSV_FIELDS = [
+min_bedroom   = 1
+max_bedroom   = 1
+min_surface   = 40
+max_surface   = 70
+postal_codes  = [1030]
+
+# Sales-specific price range
+min_price_sales = None
+max_price_sales = 180000
+
+# Rental-specific price range
+min_price_rental = None
+max_price_rental = None
+
+# ─────────────────────────────────────────────
+#  OUTPUT FILES
+# ─────────────────────────────────────────────
+CSV_SALES_FILE   = Path("immoweb_listings_for_sale.csv")
+CSV_RENTAL_FILE  = Path("immoweb_listings_for_rent.csv")
+
+CSV_FIELDS_SALES = [
     "id",
     "url",
     "price",
@@ -26,17 +47,19 @@ CSV_FIELDS = [
     "type",
     "bedrooms",
     "area",
-    "description",
-    "is_private",
 ]
 
-# To customize: go to immoweb.be, set your filters, copy the URL
-SEARCH_URL = (
-    "https://www.immoweb.be/en/search/house-and-apartment/for-rent"
-    "?countries=BE"
-    "&localities=Ixelles"
-    "&orderBy=newest"
-)
+CSV_FIELDS_RENTAL = [
+    "id",
+    "url",
+    "price",
+    "monthly_costs",
+    "locality",
+    "zip",
+    "type",
+    "bedrooms",
+    "area",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -62,28 +85,60 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
+#  URL BUILDER
+# ─────────────────────────────────────────────
+def build_url(mode: str) -> str:
+    """Build the Immoweb search URL for 'for-sale' or 'for-rent'."""
+    assert mode in ("for-sale", "for-rent")
+
+    base = f"https://www.immoweb.be/en/search/apartment/{mode}?countries=BE"
+
+    params = {}
+    if min_bedroom   is not None: params["minBedroomCount"] = min_bedroom
+    if max_bedroom   is not None: params["maxBedroomCount"] = max_bedroom
+    if min_surface   is not None: params["minSurface"]      = min_surface
+    if max_surface   is not None: params["maxSurface"]      = max_surface
+
+    if postal_codes:
+        codes = ",".join(f"BE-{c}" for c in postal_codes)
+        params["postalCodes"] = codes
+
+    if mode == "for-sale":
+        if min_price_sales  is not None: params["minPrice"]   = min_price_sales
+        if max_price_sales  is not None: params["maxPrice"]   = max_price_sales
+        params["priceType"] = "SALE_PRICE"
+    else:
+        if min_price_rental is not None: params["minPrice"]   = min_price_rental
+        if max_price_rental is not None: params["maxPrice"]   = max_price_rental
+        params["priceType"] = "MONTHLY_RENTAL_PRICE"
+
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"{base}&{query}" if query else base
+
+
+# ─────────────────────────────────────────────
 #  CSV OUTPUT
 # ─────────────────────────────────────────────
-def write_csv(listings: list[dict]):
-    CSV_OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with CSV_OUTPUT_FILE.open("w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDS)
+def write_csv(listings: list[dict], output_file: Path, fields: list[str]):
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fields)
         writer.writeheader()
         for listing in listings:
-            row = {k: listing.get(k, "") for k in CSV_FIELDS}
-            row["is_private"] = "yes" if listing.get("is_private") else "no"
-            writer.writerow(row)
-    log.info(f"Wrote {len(listings)} listings to {CSV_OUTPUT_FILE}")
+            writer.writerow({k: listing.get(k, "") for k in fields})
+    log.info(f"Wrote {len(listings)} listings to {output_file}")
 
 
 # ─────────────────────────────────────────────
 #  IMMOWEB SCRAPING
 # ─────────────────────────────────────────────
-def fetch_search_results() -> list[dict]:
+def fetch_search_results(search_url: str) -> list[dict]:
+    log.info(f"Search URL: {search_url}")
     log.info("Fetching search results from Immoweb...")
     try:
-        r = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
+        r = requests.get(search_url, headers=HEADERS, timeout=15)
         r.raise_for_status()
+        log.info(f"Search page response: HTTP {r.status_code}")
     except Exception as e:
         log.error(f"Failed to fetch search page: {e}")
         return []
@@ -91,8 +146,8 @@ def fetch_search_results() -> list[dict]:
     soup = BeautifulSoup(r.text, "html.parser")
     listings = []
 
-    # URL format: /en/classified/{type}/for-(rent|sale)/{locality}/{zip}/{id}
     cards = soup.select("article.card--result")
+    log.info(f"Found {len(cards)} listing cards on the page.")
     for card in cards:
         a_tag = card.select_one("a[href*='/classified/']")
         if not a_tag:
@@ -102,17 +157,17 @@ def fetch_search_results() -> list[dict]:
         if not url_match:
             continue
         prop_type, locality, zip_code, listing_id = url_match.groups()
-        # Surface area sits in the property-info cell
         area = "?"
         prop_info = card.select_one(".card__information--property")
         if prop_info:
             area_match = re.search(r"(\d+)", prop_info.get_text())
             if area_match:
                 area = area_match.group(1)
+        log.info(f"  [{listing_id}] {prop_type} in {locality} {zip_code}, area={area}m²")
         listings.append({
             "id": listing_id,
             "url": href,
-            "price": "N/A",  # price is JS-rendered on search page; filled in by fetch_listing_detail
+            "price": "N/A",
             "locality": locality.replace("-", " ").title(),
             "zip": zip_code,
             "type": prop_type,
@@ -124,18 +179,19 @@ def fetch_search_results() -> list[dict]:
     return listings
 
 
-def fetch_listing_detail(listing: dict) -> dict:
-    time.sleep(random.uniform(2, 5))  # polite delay
+def fetch_listing_detail(listing: dict, index: int, total: int) -> dict:
+    log.info(f"[{index}/{total}] Fetching detail for listing {listing['id']} ({listing['locality']})...")
+    time.sleep(random.uniform(2, 5))
     try:
         r = requests.get(listing["url"], headers=HEADERS, timeout=15)
         r.raise_for_status()
+        log.info(f"[{index}/{total}] HTTP {r.status_code} OK")
     except Exception as e:
-        log.warning(f"Failed to fetch listing {listing['id']}: {e}")
+        log.warning(f"[{index}/{total}] Failed to fetch listing {listing['id']}: {e}")
         return listing
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Price, bedrooms, area from window.classified JSON
     for script in soup.find_all("script"):
         t = script.string or ""
         if "window.classified" in t:
@@ -145,48 +201,37 @@ def fetch_listing_detail(listing: dict) -> dict:
                     data = json.loads(m.group(1))
                     price_data = data.get("price", {}) or {}
                     listing["price"] = price_data.get("mainValue", "N/A")
+                    listing["monthly_costs"] = price_data.get("additionalValue", "")
                     prop = data.get("property", {}) or {}
                     listing["bedrooms"] = prop.get("bedroomCount", "?")
                     listing["area"] = prop.get("netHabitableSurface", listing.get("area", "?"))
-                except Exception:
-                    pass
+                    log.info(f"[{index}/{total}] Price={listing['price']}, MonthlyCosts={listing['monthly_costs']}, Bedrooms={listing['bedrooms']}, Area={listing['area']}m²")
+                except Exception as e:
+                    log.warning(f"[{index}/{total}] Failed to parse window.classified: {e}")
             break
-
-    # Description from HTML
-    desc_el = soup.select_one("p.classified__description, .classified__description")
-    listing["description"] = desc_el.get_text(separator=" ", strip=True)[:500] if desc_el else ""
-
-    # Private owner detection
-    is_private = False
-    agent_section = soup.select_one("[class*='agency'], [class*='agent'], [class*='advertiser']")
-    if agent_section:
-        agent_text = agent_section.get_text().lower()
-        is_private = "private" in agent_text or "particulier" in agent_text or "eigenaar" in agent_text
-    listing["is_private"] = is_private
 
     return listing
 
 
 # ─────────────────────────────────────────────
-#  MAIN JOB
+#  SCRAPER RUNNER
 # ─────────────────────────────────────────────
-def run_scraper():
+def run_scraper(mode: str, output_file: Path):
+    search_url = build_url(mode)
     log.info("=" * 50)
-    log.info("Running scraper job...")
+    log.info(f"Running scraper for {mode}...")
+    log.info(f"URL: {search_url}")
 
-    listings = fetch_search_results()
-
+    listings = fetch_search_results(search_url)
     if not listings:
         log.warning("No listings found. Immoweb may have changed its structure.")
         return
 
-    detailed_listings = []
-    for listing in listings:
-        log.info(f"Fetching details for listing {listing['id']}...")
-        detailed_listings.append(fetch_listing_detail(listing))
-
-    write_csv(detailed_listings)
-    log.info(f"Done. Processed {len(detailed_listings)} listings.")
+    total = len(listings)
+    fields = CSV_FIELDS_RENTAL if mode == "for-rent" else CSV_FIELDS_SALES
+    detailed = [fetch_listing_detail(l, i, total) for i, l in enumerate(listings, start=1)]
+    write_csv(detailed, output_file, fields)
+    log.info(f"Done. Processed {len(detailed)} listings → {output_file.resolve()}")
 
 
 # ─────────────────────────────────────────────
@@ -194,4 +239,5 @@ def run_scraper():
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Immoweb CSV scraper starting up...")
-    run_scraper()
+    run_scraper("for-sale", CSV_SALES_FILE)
+    run_scraper("for-rent", CSV_RENTAL_FILE)

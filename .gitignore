@@ -3,3 +3,6 @@ scraper.log
 __pycache__/
 *.pyc
 .env
+page.html
+probe.py
+immoweb_listings.csv
